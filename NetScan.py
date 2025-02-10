@@ -3,150 +3,139 @@ import asyncio
 import argparse
 import ipaddress
 import re
-import random
-import time
+import aiofiles
 from colorama import Fore, Style, init
-
-
+import time
 # Initialize colorama
-init()
+init(autoreset=True)
 
+LOGO = fr"""{Fore.GREEN}
+                              ____   _____  _________
+                          ( (    /|(  ____ \\__   __/
+                          |  \  ( || (    \/   ) (   
+                          |   \ | || (__       | |   
+                          | (\ \) ||  __)      | |   
+                          | | \   || (         | |   
+                          | )  \  || (____/\   | |   
+                          |/    )_)(_______/   )_(   
+                                                     
+         _______  _______  _______  _        _        _______  _______ 
+        (  ____ \(  ____ \(  ___  )( (    /|( (    /|(  ____ \(  ____ )
+        | (    \/| (    \/| (   ) ||  \  ( ||  \  ( || (    \/| (    )|
+        | (_____ | |      | (___) ||   \ | ||   \ | || (__    | (____)|
+        (_____  )| |      |  ___  || (\ \) || (\ \) ||  __)   |     __)
+              ) || |      | (   ) || | \   || | \   || (      | (\ (   
+        /\____) || (____/\| )   ( || )  \  || )  \  || (____/\| ) \ \__
+        \_______)(_______/|/     \||/    )_)|/    )_)(_______/|/   \__/                                           
+{Style.RESET_ALL}"""
 # Default maximum concurrent connections
 DEFAULT_MAX_CONCURRENT_CONNECTIONS = 1000
 
-
-# Function to resolve host
 def resolve_host(host):
+    """Преобразует доменное имя или IP-адрес в список IP-адресов."""
     try:
-        if re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", host):  # Direct IP
-            return [host]
-        elif '/' in host:  # CIDR notation (e.g., 192.168.1.0/24)
+        if re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", host):
+            return [host]  # Уже IP
+        elif '/' in host:
             return [str(ip) for ip in ipaddress.IPv4Network(host, strict=False)]
-        else:  # Hostname or URL
-            return [socket.gethostbyname(host)]
-    except socket.gaierror:
-        raise ValueError("Invalid host or domain name")
+        else:
+            return [socket.gethostbyname(host)]  # Преобразуем домен в IP
+    except (socket.gaierror, ValueError):
+        raise ValueError(f"Invalid host or domain name: {host}")
 
 
-# Function to parse ports
+
 def parse_ports(port_input):
-    if port_input == "-":  # Scan all ports
-        return range(1, 65536)
-    elif "-" in port_input:  # Range of ports
-        start, end = map(int, port_input.split("-"))
-        return range(start, end + 1)
-    else:  # Single or multiple ports
-        return list(map(int, port_input.split(",")))
-
-
-# Function to read IPs from a file
-def read_ips_from_file(file_path):
-    ips = []
+    """Разбирает строку с портами (одиночные, диапазон или все)."""
     try:
-        with open(file_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and re.match(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$", line):  # Validate IP address format
-                    ips.append(line)
-                elif re.match(r"^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$", line):  # Validate domain name
-                    ips.append(socket.gethostbyname(line))
-        return ips
-    except FileNotFoundError:
-        raise ValueError(f"File {file_path} not found.")
-    except Exception as e:
-        raise ValueError(f"Error reading file {file_path}: {e}")
+        if port_input == "-":
+            return range(1, 65536)  # Все порты
+        elif "-" in port_input:
+            start, end = map(int, port_input.split("-"))
+            if 1 <= start <= end <= 65535:
+                return range(start, end + 1)
+        else:
+            ports = list(map(int, port_input.split(",")))
+            if all(1 <= p <= 65535 for p in ports):
+                return ports
+        raise ValueError("Invalid port range")
+    except ValueError:
+        raise ValueError(f"Invalid port input: {port_input}")
 
-# Function to remove ANSI escape codes (colors)
+
+
 def remove_ansi_escape_codes(text):
+    """Удаляет ANSI коды из текста."""
     return re.sub(r'\x1b\[[0-9;]*m', '', text)
 
 
-# Function to scan a single port
 async def scan_port(ip, port, semaphore, output_file):
+    """Сканирует указанный порт асинхронно с учетом таймаута."""
     async with semaphore:
-        await asyncio.sleep(random.uniform(0.01, 0.05))  # Introduce slight delay to avoid overwhelming the network
-        conn = asyncio.open_connection(ip, port)
         try:
-            reader, writer = await asyncio.wait_for(conn, timeout=0.5)  # Increased timeout for better accuracy
+            conn = asyncio.open_connection(ip, port)
+            reader, writer = await asyncio.wait_for(conn, timeout=1.0)  # Увеличен таймаут до 1 сек
+            result = f"{Fore.GREEN}[+] {ip}:{port} is open{Style.RESET_ALL}"
             writer.close()
             await writer.wait_closed()
-            result = f"{Fore.GREEN}[+] {ip}:{port} is open{Style.RESET_ALL}"
+        except (asyncio.TimeoutError, ConnectionRefusedError):
+            return  # Порт закрыт или недоступен
+        except OSError as e:
+            if e.winerror == 121:  # Превышен таймаут семафора
+                return
+            result = f"{Fore.YELLOW}[!] Error scanning {ip}:{port}: {e}{Style.RESET_ALL}"
+        except Exception as e:
+            result = f"{Fore.YELLOW}[!] Unexpected error scanning {ip}:{port}: {e}{Style.RESET_ALL}"
+        else:
+            result = None
+
+        if result:
             print(result)
             if output_file:
-                # Remove color codes before writing to the file
-                output_file.write(remove_ansi_escape_codes(result) + '\n')
-        except (asyncio.TimeoutError, ConnectionRefusedError):
-            pass  # Ignore closed ports
-        except Exception as e:
-            if "[WinError 5]" not in str(e):  # Filter out access denied errors
-                result = f"{Fore.YELLOW}[!] Error scanning {ip}:{port}: {e}{Style.RESET_ALL}"
-                print(result)
-                if output_file:
-                    # Remove color codes before writing to the file
-                    output_file.write(remove_ansi_escape_codes(result) + '\n')
+                async with aiofiles.open(output_file, 'a') as f:
+                    await f.write(remove_ansi_escape_codes(result) + '\n')
 
 
-# Function to run async scanning
 async def async_scan(ips, ports, max_connections, output_file):
+    """Асинхронно сканирует список IP-адресов и портов."""
     semaphore = asyncio.Semaphore(max_connections)
-    tasks = [scan_port(ip, port, semaphore, output_file) for ip in ips for port in ports]
+    tasks = [asyncio.create_task(scan_port(ip, port, semaphore, output_file)) for ip in ips for port in ports]
     await asyncio.gather(*tasks)
 
 
-# Main function
-def main():
-    start_time = time.time()  # Time when scanning starts
 
-    parser = argparse.ArgumentParser(description="High-speed masscan-like port scanner")
-    parser.add_argument("host", type=str, nargs='?', default=None,
-                        help="Host, IP range, or CIDR to scan. Ignored if -input is provided")
-    parser.add_argument("-p", "--ports", type=str, default="1-1000",
-                        help="Ports to scan (e.g., 80,443 or 1-1000 or all with '-')")
-    parser.add_argument("-t", "--threads", type=int, default=DEFAULT_MAX_CONCURRENT_CONNECTIONS,
-                        help="Maximum number of concurrent connections (default is 1000)")
-    parser.add_argument("-i", "--input", type=str, help="File with IP addresses or domains to scan")
-    parser.add_argument("-o", "--output", type=str, help="Output file to save scan results")
+def main():
+    print(LOGO)
+    start_time = time.time()
+
+    parser = argparse.ArgumentParser(description="High-speed port scanner like a Masscan written in Python PL")
+    parser.add_argument("host", type=str, nargs='?', default=None, help="Host(domain/URL), IP range, or CIDR to scan.")
+    parser.add_argument("-p", "--ports", type=str, default="1-1000", help="Ports to scan (e.g., 80,443 or 1-1000 or '-')")
+    parser.add_argument("-t", "--threads", type=int, default=DEFAULT_MAX_CONCURRENT_CONNECTIONS, help="Max concurrent connections(default value == 1000)")
+    parser.add_argument("-o", "--output", type=str, help="Output file to save scan results(output file == simple txt file like a result.txt")
 
     args = parser.parse_args()
 
     try:
-        # Check if input file is provided, otherwise use host
-        if args.input:
-            ips = read_ips_from_file(args.input)
-        elif args.host:
+        if args.host:
             ips = resolve_host(args.host)
         else:
-            raise ValueError("You must provide either a host or an input file.")
+            raise ValueError("You must provide a host.")
 
         ports = parse_ports(args.ports)
+        output_file = open(args.output, 'w') if args.output else None
 
-        # Prepare output file if needed
-        output_file = None
-        if args.output:
-            output_file = open(args.output, 'w')
-
-        print(f"{Fore.BLUE}Starting scan on {', '.join(ips)} ({len(ips)} IPs), ports: {args.ports}{Style.RESET_ALL}")
-
-        # Print the selected IPs and ports
-        for ip in ips:
-            print(f"{Fore.CYAN}IP Address: {ip}{Style.RESET_ALL}")
-
-        # Run the async scan with the user-specified number of concurrent connections
+        print(f"{Fore.BLUE}Starting scan on {args.host}, ports: {args.ports}{Style.RESET_ALL}")
         asyncio.run(async_scan(ips, ports, args.threads, output_file))
-
-        # Close the output file if opened
         if output_file:
             output_file.close()
-
     except Exception as e:
         print(f"{Fore.RED}[!] Error: {e}{Style.RESET_ALL}")
 
-    # Calculate and display the time taken for the scan
     end_time = time.time()
     elapsed_time = end_time - start_time
     minutes, seconds = divmod(elapsed_time, 60)
     print(f"\n{Fore.YELLOW}Scan completed in {int(minutes)} minutes and {int(seconds)} seconds{Style.RESET_ALL}")
-
 
 if __name__ == "__main__":
     main()
